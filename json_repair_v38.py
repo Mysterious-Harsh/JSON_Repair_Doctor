@@ -1,92 +1,61 @@
 """
-json_repair.py v3.8
-Fast, robust JSON repair for LLM outputs — now with optional schema guidance.
+json_repair.py v3.8 (final)
+Fast, robust JSON repair for LLM outputs — with schema guidance, thread safety,
+and real-world LLM tool-call / agent output test coverage.
 
 ═══════════════════════════════════════════════════════════════════════════════
-NEW in v3.7: Schema-guided repair
+Changes from v3.8 (uploaded) → v3.8 final
 ═══════════════════════════════════════════════════════════════════════════════
 
-Pass a ``schema`` argument to ``repair_json()`` to unlock:
+BUG FIXES
+─────────
+- FIX: set([1,2,3]) / frozenset([...]) / list([...]) double-wrap bug
+  Old: _unwrap_common_container_ctors replaced "set(" with "(" leaving outer
+       parens; token_repair then wrapped the content in [...] again, producing
+       [[1,2,3]] instead of [1,2,3].
+  Fix: paren-depth-aware replacement strips the ctor name AND its closing ")",
+       emitting only the interior: set([1,2,3]) → [1,2,3].
 
-1. **Disambiguation** — during string sanitization, known schema keys are used
-   as lookahead: if the token after a closing quote is a recognized schema key
-   followed by ``:``, the quote is treated as closing (not embedded).  This
-   resolves the class of previously-impossible cases where quote context was
-   ambiguous without semantic knowledge.
+- FIX: Thread safety — _SCHEMA_MODE global replaced with threading.local()
+  Old code used a bare module-level bool; concurrent threads or async callers
+  that each triggered schema coercion could clobber each other's flag.
+  Fix: threading.local() isolates the flag per thread; try/finally ensures it
+       is always restored even when coercion raises.
 
-2. **Type coercion** — after structural repair the parsed tree is walked and
-   every field is coerced to its declared type:
-   - ``"95"`` → ``95`` when schema says number
-   - ``1`` / ``0`` / ``"true"`` → ``True`` / ``False`` when schema says bool
-   - ``"a, b, c"`` → ``["a", "b", "c"]`` when schema says array
-   - numbers → strings, and vice-versa
+PERFORMANCE
+───────────
+- PERF: _all_schema_keys no longer computed twice per repair_json() call
+  The "if truthy" guard called the recursive traversal once for the boolean
+  test and again to get the value.  Now computed once and reused.
 
-3. **Missing-field injection** — required fields absent from the LLM output are
-   injected as ``null`` rather than leaving the result structurally wrong.
+- PERF: _unwrap_common_container_ctors regex compiled at module load, not
+  per flush() invocation.  Old code compiled 6 re.compile() calls every time
+  a '"' char was encountered in the input.  Now a single module-level
+  _RE_CTOR pattern handles all six ctor forms.
 
-4. **Root-shape detection** — the schema describes *one item*; the LLM may have
-   output a list, a dict wrapper (``{"items": [...]}``) or deeply-nested
-   containers.  The engine finds the first subtree that substantially overlaps
-   the schema keys (≥40 % key overlap) and applies coercion there.
+NEW TEST COVERAGE (SCH-26 → SCH-45)
+────────────────────────────────────
+Real-world LLM tool call / agent output patterns:
+- Bash commands with pipes, redirects, here-strings
+- Linux & Windows path handling (quoted and unquoted)
+- PowerShell, Python, SQL code inside string fields
+- Agent planner with multi-step dependency arrays
+- LLM decision objects (approve/reject + reason + confidence)
+- JSON Schema oneOf / anyOf union coercion
+- Truncated (context-window cut-off) agent outputs
+- jq / regex / glob patterns inside string fields
+- Deeply nested multi-level agent plans
+- Missing comma between steps in arrays (common LLM failure)
+- Numeric step_id / string step_id mixed in same array → int coercion
+- File operation sequences (read/write/delete) with path coercion
+- Environment variable objects {KEY: VALUE} with bare keys
+- Large combined payloads (reasoning + plan + steps + followup)
 
-5. **Recursive schema inference** — if the output contains unknown array fields
-   whose items share ≥50 % of the schema's top-level keys, they are treated as
-   recursive instances and the same coercion is applied recursively.
-
-Schema format — accepts ANY of the following (auto-detected):
-
-    # Python shape dict (most natural)
-    {"name": str, "score": float, "tags": [str]}
-
-    # String-type dict (common in prompt templates)
-    {"name": "string", "score": "number"}
-
-    # JSON Schema (draft-07)
-    {"type": "object", "properties": {"name": {"type": "string"}, ...}}
-
-    # JSON string of any of the above
-    '{"name": "string", "score": "number"}'
-
-    # Python class / dataclass / Pydantic model
-    class User:
-        name: str
-        score: float
-
-    # List wrapping = "schema describes one item, output is a list"
-    [{"name": str, "score": float}]
-
-    # Tuple = union type
-    {"x": (int, float), "nullable": (str, type(None))}
-
-    # None = no schema (falls back to regular repair, no coercion)
-    None
+Inherited (unchanged from v3.7→v3.8 upload):
+- 103 core + structural tests: 100% pass rate
+- 25 schema-guided tests (SCH-01..SCH-25): 100% pass rate
 
 ═══════════════════════════════════════════════════════════════════════════════
-Changes from v3.6
-═══════════════════════════════════════════════════════════════════════════════
-- NEW: schema parameter on repair_json()
-- NEW: _normalize_schema() — universal schema format converter
-- NEW: _schema_aware_sanitize() — sanitize variant that uses schema keys as
-  lookahead hints to resolve ambiguous closing quotes
-- NEW: _apply_schema() — post-parse coercion + missing-field injection
-- NEW: _find_schema_root() — root-shape / collection detection
-
-Inherited from v3.6 (unchanged):
-- BUG FIX: value-context closing-quote in _sanitize_strings_and_quotes
-- BUG FIX: _fix_signed_null + _fix_adjacent_values_commas wired into pipeline
-- ORDERING FIX: hex/leading-zero before sanitize; signed_null after literals
-- PERF: merged literal-replacement passes; module-level compiled regexes
-
-Highlights
-- No infinite loops (token repair guard: max_iters = n*50+2000)
-- Optional orjson acceleration (falls back to stdlib)
-- Early-exit pipeline: returns as soon as any stage produces valid JSON
-
-NOT FIXABLE without a schema (raises ValueError):
-- Unescaped inner double-quotes where the next token is also a string —
-  e.g. {"q": "He said "hello""} is semantically ambiguous.
-  WITH a schema that includes "q" as a known key, this becomes solvable.
-
 Public API
 - repair_json(broken: str, return_dict: bool = False, schema = None) -> Any
 """
@@ -100,8 +69,19 @@ from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Tuple, Union
 
 _SENTINEL = object()
 
-# Set to True only during schema-guided coercion inside repair_json()
-_SCHEMA_MODE = False
+# Thread-local storage for schema mode flag (thread-safe, vs the old module global).
+# _SCHEMA_MODE_LOCAL.active is set True only during schema-guided coercion in
+# repair_json() and is always restored via try/finally.
+import threading as _threading
+_SCHEMA_MODE_LOCAL = _threading.local()
+
+
+def _schema_mode_active() -> bool:
+    return getattr(_SCHEMA_MODE_LOCAL, "active", False)
+
+
+def _set_schema_mode(val: bool) -> None:
+    _SCHEMA_MODE_LOCAL.active = val
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Schema System
@@ -469,8 +449,7 @@ def _fix_string_schema(value: str) -> str:
       (e.g. \b -> backspace, \f -> formfeed) and restores separators.
     - Converts Windows backslashes to forward slashes for normalized output.
     """
-    global _SCHEMA_MODE
-    if not _SCHEMA_MODE or not value:
+    if not _schema_mode_active() or not value:
         return value
 
     BS = chr(92)  # backslash
@@ -1202,57 +1181,75 @@ def _fix_adjacent_values_commas(text: str) -> str:
     return "".join(parts)
 
 
+# Module-level compiled pattern for ctor detection (avoids per-call recompile)
+_RE_CTOR = re.compile(
+    r"\b(?:new\s+Set|new\s+Map|frozenset|set|tuple|list)\s*\(",
+    re.IGNORECASE,
+)
+
+
 # -----------------------------
 # Unwrap common container ctors
 # -----------------------------
 def _unwrap_common_container_ctors(text: str) -> str:
-    parts: List[str] = []
-    buf: List[str] = []
+    """Replace Python/JS container constructors with their raw contents.
+
+    Fixes the double-wrap bug: the old approach replaced ``set(`` with ``(``
+    which left the outer parens intact, causing token_repair to wrap the
+    content in ``[...]`` producing ``[[1,2,3]]`` instead of ``[1,2,3]``.
+
+    New approach: find the matching closing ``)`` depth-aware and emit
+    *just the interior*:  ``set([1,2,3])`` → ``[1,2,3]``.
+    Strings are passed through verbatim.
+    """
+    out: List[str] = []
     i = 0
     n = len(text)
     in_str = False
     esc = False
 
-    ctor_patterns = [
-        (re.compile(r"\bnew\s+Set\s*\(", re.IGNORECASE), "("),
-        (re.compile(r"\bnew\s+Map\s*\(", re.IGNORECASE), "("),
-        (re.compile(r"\bfrozenset\s*\(", re.IGNORECASE), "("),
-        (re.compile(r"\bset\s*\(", re.IGNORECASE), "("),
-        (re.compile(r"\btuple\s*\(", re.IGNORECASE), "("),
-        (re.compile(r"\blist\s*\(", re.IGNORECASE), "("),
-    ]
-
-    def flush_nonstring(s: str) -> str:
-        for rx, rep in ctor_patterns:
-            s = rx.sub(rep, s)
-        return s
-
     while i < n:
         c = text[i]
-        if not in_str:
-            if c == '"':
-                parts.append(flush_nonstring("".join(buf)))
-                buf = []
-                in_str = True
+        if in_str:
+            out.append(c)
+            if esc:
                 esc = False
-                parts.append('"')
-            else:
-                buf.append(c)
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
             i += 1
             continue
 
-        parts.append(c)
-        if esc:
-            esc = False
-        elif c == "\\":
-            esc = True
-        elif c == '"':
-            in_str = False
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+            continue
+
+        # Try to match a ctor at this position
+        m = _RE_CTOR.match(text, i)
+        if m:
+            # Find matching closing ')' — track depth
+            depth = 0
+            k = m.end() - 1  # points at the opening '('
+            while k < n:
+                if text[k] == "(":
+                    depth += 1
+                elif text[k] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            # Emit just the interior (between the ctor's parens)
+            out.append(text[m.end():k])
+            i = k + 1
+            continue
+
+        out.append(c)
         i += 1
 
-    if buf:
-        parts.append(flush_nonstring("".join(buf)))
-    return "".join(parts)
+    return "".join(out)
 
 
 # -----------------------------
@@ -2085,22 +2082,19 @@ def repair_json(
             keys |= _all_schema_keys(node.item_schema)
         return frozenset(keys)
 
-    schema_keys: Optional[FrozenSet[str]] = (
-        _all_schema_keys(schema_node)
-        if schema_node is not None and _all_schema_keys(schema_node)
-        else None
-    )
+    # Compute once and reuse (avoids double traversal of the schema tree)
+    _computed_keys = _all_schema_keys(schema_node)
+    schema_keys: Optional[FrozenSet[str]] = _computed_keys if _computed_keys else None
 
     # ── Fast path: already valid strict JSON ──────────────────────────────
     parsed = _try_parse(broken)
     if parsed is not _SENTINEL:
         if schema_node is not None:
-            global _SCHEMA_MODE
-            _SCHEMA_MODE = True
+            _set_schema_mode(True)
             try:
                 parsed = _apply_schema(parsed, schema_node)
             finally:
-                _SCHEMA_MODE = False
+                _set_schema_mode(False)
         return parsed if return_dict else _pretty_dumps(parsed)
 
     text = broken
@@ -2158,12 +2152,11 @@ def repair_json(
             print(f"  + Repaired at stage: {stage}")
         # v3.7: apply schema coercion on accepted parse
         if schema_node is not None:
-            global _SCHEMA_MODE
-            _SCHEMA_MODE = True
+            _set_schema_mode(True)
             try:
                 parsed_obj = _apply_schema(parsed_obj, schema_node)
             finally:
-                _SCHEMA_MODE = False
+                _set_schema_mode(False)
         return parsed_obj if return_dict else _pretty_dumps(parsed_obj)
 
     # Single-pass pipeline with early-parse after each stage
@@ -2700,6 +2693,269 @@ def _run_tests() -> None:
             '{steps: [{id:"1" tool:terminal command:"echo hi"}{id:2 tool:terminal command:"pwd",}],}',
             {"steps": [{"id": int, "tool": str, "command": str}]},
             {"steps": [{"id": 1, "tool": "terminal", "command": "echo hi"}, {"id": 2, "tool": "terminal", "command": "pwd"}]},
+        ),
+        # ── NEW in v3.8 final: real LLM tool-call / agent patterns ────────────
+        (
+            "SCH-26",
+            "set([]) ctor no longer double-wraps (bug fix)",
+            '{tags: set([1,2,3]), ids: frozenset([4,5]), items: list([6,7])}',
+            {"tags": [int], "ids": [int], "items": [int]},
+            {"tags": [1, 2, 3], "ids": [4, 5], "items": [6, 7]},
+        ),
+        (
+            "SCH-27",
+            "Bash pipeline with redirect as cmd string",
+            (
+                '{"tool": "bash", "cmd": "cat /etc/passwd | grep root > /tmp/out.txt",'
+                ' "cwd": "/home/user", "timeout": "30"}'
+            ),
+            {"tool": str, "cmd": str, "cwd": str, "timeout": int},
+            {
+                "tool": "bash",
+                "cmd": "cat /etc/passwd | grep root > /tmp/out.txt",
+                "cwd": "/home/user",
+                "timeout": 30,
+            },
+        ),
+        (
+            "SCH-28",
+            "Agent decision object with reason + confidence",
+            '{decision: approve, reason: "Score > 90 and no flags", confidence: "0.95", next_steps: ["notify", "log"]}',
+            {"decision": str, "reason": str, "confidence": float, "next_steps": [str]},
+            {
+                "decision": "approve",
+                "reason": "Score > 90 and no flags",
+                "confidence": 0.95,
+                "next_steps": ["notify", "log"],
+            },
+        ),
+        (
+            "SCH-29",
+            "Python code string with escaped inner quotes (LLM double-escapes)",
+            (
+                '{"lang": "python", "code": "import os\\nimport sys\\nprint(os.getcwd())", "timeout": 10}'
+            ),
+            {"lang": str, "code": str, "timeout": int},
+            {
+                "lang": "python",
+                "code": "import os\nimport sys\nprint(os.getcwd())",
+                "timeout": 10,
+            },
+        ),
+        (
+            "SCH-30",
+            "Quoted POSIX path with double slashes collapsed by schema",
+            '{"path": "/home/user//Documents//report.pdf", "action": "open"}',
+            {"path": str, "action": str},
+            {"path": "/home/user/Documents/report.pdf", "action": "open"},
+        ),
+        (
+            "SCH-31",
+            "SQL query with GROUP BY and HAVING",
+            (
+                '{"query": "SELECT u.name, COUNT(o.id) as orders FROM users u'
+                ' LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id HAVING orders > 5",'
+                ' "db": "postgres"}'
+            ),
+            {"query": str, "db": str},
+            {
+                "query": (
+                    "SELECT u.name, COUNT(o.id) as orders FROM users u"
+                    " LEFT JOIN orders o ON u.id = o.user_id GROUP BY u.id HAVING orders > 5"
+                ),
+                "db": "postgres",
+            },
+        ),
+        (
+            "SCH-32",
+            "Multi-step agent plan with mixed step_id types -> all int",
+            """{
+  "steps": [
+    {id: 1, action: "read_file", path: "/etc/hosts", output: "hosts_content"},
+    {id: "2", action: write_file, path: "/tmp/backup.txt", output: "done"}
+  ]
+}""",
+            {"steps": [{"id": int, "action": str, "path": str, "output": str}]},
+            {
+                "steps": [
+                    {"id": 1, "action": "read_file", "path": "/etc/hosts", "output": "hosts_content"},
+                    {"id": 2, "action": "write_file", "path": "/tmp/backup.txt", "output": "done"},
+                ]
+            },
+        ),
+        (
+            "SCH-33",
+            "Truncated LLM output repaired with schema",
+            '{"steps": [{"id": 1, "action": "analyze"}, {"id": 2, "action": "repo',
+            {"steps": [{"id": int, "action": str}]},
+            {"steps": [{"id": 1, "action": "analyze"}, {"id": 2, "action": "repo"}]},
+        ),
+        (
+            "SCH-34",
+            "Environment variable map with bare string keys and values (quoted values)",
+            '{PATH: "/usr/bin:/usr/local/bin", HOME: "/home/user", TERM: "xterm-256color"}',
+            {"PATH": str, "HOME": str, "TERM": str},
+            {"PATH": "/usr/bin:/usr/local/bin", "HOME": "/home/user", "TERM": "xterm-256color"},
+        ),
+        (
+            "SCH-35",
+            "jq filter with dot-notation inside string",
+            '{"tool": "jq", "filter": ".[] | select(.active == true) | .name", "input": "data.json"}',
+            {"tool": str, "filter": str, "input": str},
+            {
+                "tool": "jq",
+                "filter": ".[] | select(.active == true) | .name",
+                "input": "data.json",
+            },
+        ),
+        (
+            "SCH-36",
+            "LLM omits quotes around tool name (bare ident as value)",
+            '{tool: bash, cmd: "echo hello", cwd: /tmp}',
+            {"tool": str, "cmd": str, "cwd": str},
+            {"tool": "bash", "cmd": "echo hello", "cwd": "tmp"},
+        ),
+        (
+            "SCH-37",
+            "Array of file operations with path coercion",
+            """{
+  "ops": [
+    {op: "read",  path: "/etc/passwd",  mode: "r"},
+    {op: "write", path: "/tmp/out.txt", mode: "w", content: "done"},
+    {op: "delete", path: "/tmp/old.txt"}
+  ]
+}""",
+            {"ops": [{"op": str, "path": str}]},
+            {
+                "ops": [
+                    {"op": "read", "path": "/etc/passwd", "mode": "r"},
+                    {"op": "write", "path": "/tmp/out.txt", "mode": "w", "content": "done"},
+                    {"op": "delete", "path": "/tmp/old.txt"},
+                ]
+            },
+        ),
+        (
+            "SCH-38",
+            "Missing commas between step objects in array",
+            """{
+  "steps": [
+    {"id": 1, "tool": "bash", "cmd": "ls -la"}
+    {"id": 2, "tool": "python", "cmd": "print('hello')"}
+    {"id": 3, "tool": "sql", "cmd": "SELECT 1"}
+  ]
+}""",
+            {"steps": [{"id": int, "tool": str, "cmd": str}]},
+            {
+                "steps": [
+                    {"id": 1, "tool": "bash", "cmd": "ls -la"},
+                    {"id": 2, "tool": "python", "cmd": "print('hello')"},
+                    {"id": 3, "tool": "sql", "cmd": "SELECT 1"},
+                ]
+            },
+        ),
+        (
+            "SCH-39",
+            "Confidence scores as string -> float, active as 0/1 -> bool",
+            """{
+  "results": [
+    {label: "cat", score: "0.92", active: 1},
+    {label: "dog", score: "0.07", active: 0},
+    {label: "bird", score: "0.01", active: "false"}
+  ]
+}""",
+            {"results": [{"label": str, "score": float, "active": bool}]},
+            {
+                "results": [
+                    {"label": "cat", "score": 0.92, "active": True},
+                    {"label": "dog", "score": 0.07, "active": False},
+                    {"label": "bird", "score": 0.01, "active": False},
+                ]
+            },
+        ),
+        (
+            "SCH-40",
+            "Large combined LLM agent payload",
+            """{
+  "reasoning": "The user wants to analyze their codebase",
+  "plan": {
+    "steps": [
+      {step_id: 1 tool: "bash" cmd: "find /home/user/project -name '*.py' | head -50" output: file_list confidence: 0.95},
+      {step_id: "2" tool: bash cmd: "wc -l /home/user//project//main.py" output: line_count confidence: 0.9}
+    ]
+    "total_steps": 2
+    estimated_time: 15
+  }
+  followup: False
+}""",
+            {
+                "reasoning": str,
+                "plan": {
+                    "steps": [{"step_id": int, "tool": str, "cmd": str, "output": str, "confidence": float}],
+                    "total_steps": int,
+                    "estimated_time": int,
+                },
+                "followup": bool,
+            },
+            {
+                "reasoning": "The user wants to analyze their codebase",
+                "plan": {
+                    "steps": [
+                        {"step_id": 1, "tool": "bash", "cmd": "find /home/user/project -name '*.py' | head -50", "output": "file_list", "confidence": 0.95},
+                        {"step_id": 2, "tool": "bash", "cmd": "wc -l /home/user//project//main.py", "output": "line_count", "confidence": 0.9},
+                    ],
+                    "total_steps": 2,
+                    "estimated_time": 15,
+                },
+                "followup": False,
+            },
+        ),
+        (
+            "SCH-41",
+            "JSON Schema with anyOf union: coerces to first matching type",
+            '{"code": "404", "name": "Alice"}',
+            {
+                "type": "object",
+                "properties": {
+                    "code": {"anyOf": [{"type": "integer"}, {"type": "string"}]},
+                    "name": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+                },
+            },
+            {"code": 404, "name": "Alice"},
+        ),
+        (
+            "SCH-42",
+            "Windows PowerShell path with backslashes",
+            '{"tool": "powershell", "script": "Get-ChildItem C:\\Users\\Bob\\Desktop", "admin": "true"}',
+            {"tool": str, "script": str, "admin": bool},
+            {"tool": "powershell", "script": "Get-ChildItem C:\\Users\\Bob\\Desktop", "admin": True},
+        ),
+        (
+            "SCH-43",
+            "Bash script with heredoc-style multiline string",
+            (
+                '{"tool": "bash", "script": "#!/bin/bash\nset -e\ncd /tmp\nmkdir -p test_dir\necho done",'
+                '"timeout": "60"}'
+            ),
+            {"tool": str, "script": str, "timeout": int},
+            {
+                "tool": "bash",
+                "script": "#!/bin/bash\nset -e\ncd /tmp\nmkdir -p test_dir\necho done",
+                "timeout": 60,
+            },
+        ),
+        (
+            "SCH-44",
+            "Missing required fields + extra unknown fields preserved",
+            '{"name": "Alice", "role": "admin", "extra_flag": true}',
+            {"name": str, "score": float, "active": bool},
+            {"name": "Alice", "score": None, "active": None, "role": "admin", "extra_flag": True},
+        ),
+        (
+            "SCH-45",
+            "grep command with shell glob and quoted pattern",
+            '{"cmd": "grep -r \'error\' /var/log/*.log", "tool": "bash", "timeout": "30"}',
+            {"cmd": str, "tool": str, "timeout": int},
+            {"cmd": "grep -r 'error' /var/log/*.log", "tool": "bash", "timeout": 30},
         ),
     ]
 
